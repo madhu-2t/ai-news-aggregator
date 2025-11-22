@@ -14,29 +14,28 @@ load_dotenv()
 
 app = FastAPI()
 
-# 1. Serve Static Files (CSS/JS/HTML)
+# 1. Serve Static Files
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # --- GEMINI CONFIG ---
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-# Use 2.5 Flash or Flash Latest
 model = genai.GenerativeModel('gemini-2.5-flash')
 
-# Ensure DB tables exist
 Base.metadata.create_all(bind=engine)
 
-# --- HELPER: AI SUMMARIZER ---
-def generate_summary(text):
-    # Rate Limiting: Sleep 2s to avoid hitting free tier limits
-    time.sleep(2)
+# --- HELPER: FINANCIAL ANALYST AI ---
+def generate_financial_summary(text):
+    time.sleep(2) # Rate limiting
     
     try:
+        # Specialized prompt for finance
         prompt = f"""
-        You are a news editor. 
-        1. Summarize this text in one concise sentence.
-        2. Classify sentiment as Positive, Negative, or Neutral.
+        You are a Senior Financial Analyst. 
+        1. Analyze this news for market impact. Summarize in 1 sharp sentence.
+        2. Classify sentiment strictly as: Bullish, Bearish, or Neutral.
+        
         Format: SUMMARY | SENTIMENT
-        Text: {text}
+        News: {text}
         """
         response = model.generate_content(prompt)
         content = response.text.strip()
@@ -47,47 +46,49 @@ def generate_summary(text):
         return content, "Neutral"
     except Exception as e:
         print(f"AI Error: {e}")
-        return "Summary unavailable", "Neutral"
+        return "Analysis pending...", "Neutral"
 
 # --- ROUTES ---
 
-# Serve the Frontend
 @app.get("/")
 def read_root():
     return FileResponse("static/index.html")
 
 @app.post("/scrape")
-def scrape_news(db: Session = Depends(get_db)):
+def scrape_finance(db: Session = Depends(get_db)):
     api_key = os.getenv("NEWS_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="NewsAPI Key missing")
     
-    # Categories to scrape
-    categories = ["technology", "business", "science"]
+    # STRATEGY: Mix of Indian and Global Markets
+    sources = [
+        {"country": "in", "category": "business", "label": "🇮🇳 India Market"},
+        {"country": "us", "category": "business", "label": "🇺🇸 US Market"}
+    ]
+    
     total_scraped = 0
     
-    for category in categories:
-        print(f"Fetching {category} news...")
-        url = f"https://newsapi.org/v2/top-headlines?category={category}&language=en&apiKey={api_key}"
+    for source in sources:
+        print(f"Fetching {source['label']}...")
+        url = f"https://newsapi.org/v2/top-headlines?country={source['country']}&category={source['category']}&apiKey={api_key}"
         
         try:
             resp = requests.get(url)
             data = resp.json()
-            articles = data.get("articles", [])[:4] # Limit 4 per category (12 total)
+            articles = data.get("articles", [])[:6] # Fetch 6 from India, 6 from US
             
             for article in articles:
-                # Validation
-                if not article.get('title') or not article.get('description'):
+                if not article.get('title'):
                     continue
                 
-                # Duplicate Check
+                # Check duplicates
                 existing = db.query(NewsItem).filter(NewsItem.url == article['url']).first()
                 if existing:
                     continue
 
-                # AI Process
-                raw_text = f"{article['title']} - {article['description']}"
-                summary, sentiment = generate_summary(raw_text)
+                # AI Analysis
+                raw_text = f"{article['title']} - {article.get('description', '')}"
+                summary, sentiment = generate_financial_summary(raw_text)
                 
                 # Save
                 news_item = NewsItem(
@@ -101,12 +102,11 @@ def scrape_news(db: Session = Depends(get_db)):
                 total_scraped += 1
                 
         except Exception as e:
-            print(f"Error scraping {category}: {e}")
+            print(f"Error scraping {source['label']}: {e}")
             continue
 
-    return {"message": f"Scraped {total_scraped} new articles across categories."}
+    return {"message": f"Analysed {total_scraped} financial news items."}
 
 @app.get("/news")
 def get_news(db: Session = Depends(get_db)):
-    # Return top 20 latest news
     return db.query(NewsItem).order_by(NewsItem.id.desc()).limit(20).all()

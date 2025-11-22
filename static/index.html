@@ -11,7 +11,7 @@
 
     <nav class="bg-gray-800 border-b border-gray-700 p-4 sticky top-0 z-50">
         <div class="container mx-auto flex justify-between items-center">
-            <h1 class="text-2xl font-bold text-blue-400"><i class="fas fa-robot mr-2"></i>AI News Digest</h1>
+           <h1 class="text-2xl font-bold text-green-400"><i class="fas fa-chart-line mr-2"></i>Market Pulse AI</h1>
             <button onclick="triggerScrape()" id="scrapeBtn" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded transition">
                 <i class="fas fa-sync-alt mr-2"></i> Refresh News
             </button>
@@ -39,9 +39,9 @@
                 
                 articles.forEach(article => {
                     // Color code sentiment
-                    let badgeColor = 'bg-gray-600';
-                    if(article.sentiment_score.includes('Positive')) badgeColor = 'bg-green-600';
-                    if(article.sentiment_score.includes('Negative')) badgeColor = 'bg-red-600';
+                    let badgeColor = 'bg-gray-600'; // Neutral
+                    if(article.sentiment_score.includes('Bullish') || article.sentiment_score.includes('Positive')) badgeColor = 'bg-green-600';
+                    if(article.sentiment_score.includes('Bearish') || article.sentiment_score.includes('Negative')) badgeColor = 'bg-red-600';
 
                     const card = `
                         <div class="bg-gray-800 rounded-lg overflow-hidden shadow-lg hover:shadow-2xl transition border border-gray-700 flex flex-col">
