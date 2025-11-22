@@ -9,45 +9,53 @@ from sqlalchemy.orm import Session
 from database import get_db
 from models import NewsItem, Base, engine
 from dotenv import load_dotenv
+from datetime import datetime, timedelta, timezone
+from dateutil import parser 
 
 load_dotenv()
 
 app = FastAPI()
-
-# 1. Serve Static Files
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# --- GEMINI CONFIG ---
+# --- CONFIG ---
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel('gemini-2.5-flash')
 
 Base.metadata.create_all(bind=engine)
 
-# --- HELPER: FINANCIAL ANALYST AI ---
 def generate_financial_summary(text):
-    time.sleep(2) # Rate limiting
-    
+    # time.sleep(2) # Uncomment this if you see "429 Resource Exhausted" errors
     try:
-        # Specialized prompt for finance
+        # Check if key is present
+        if not os.getenv("GEMINI_API_KEY"):
+            print("❌ ERROR: GEMINI_API_KEY is missing from environment variables!")
+            return "System Error: Missing API Key", "Neutral"
+
         prompt = f"""
-        You are a Senior Financial Analyst. 
-        1. Analyze this news for market impact. Summarize in 1 sharp sentence.
-        2. Classify sentiment strictly as: Bullish, Bearish, or Neutral.
-        
+        You are a Financial Analyst. 
+        1. Summarize this in 1 sentence.
+        2. Sentiment: Bullish, Bearish, or Neutral.
         Format: SUMMARY | SENTIMENT
         News: {text}
         """
-        response = model.generate_content(prompt)
-        content = response.text.strip()
         
-        if "|" in content:
-            summary, sentiment = content.split("|", 1)
-            return summary.strip(), sentiment.strip()
-        return content, "Neutral"
-    except Exception as e:
-        print(f"AI Error: {e}")
-        return "Analysis pending...", "Neutral"
+        # Explicitly use 1.5-flash
+        response = model.generate_content(prompt)
+        
+        # Check if response was blocked by safety filters
+        if not response.text:
+            print(f"⚠️ Gemini blocked content for safety: {response.prompt_feedback}")
+            return "Content filtered by AI", "Neutral"
 
+        content = response.text.strip()
+        if "|" in content:
+            return content.split("|", 1)
+        return content, "Neutral"
+        
+    except Exception as e:
+        # THIS IS THE CRITICAL PART - PRINT THE ERROR
+        print(f"🔥 AI CRASH: {str(e)}") 
+        return f"Analysis Failed: {str(e)[:20]}...", "Neutral"
 # --- ROUTES ---
 
 @app.get("/")
@@ -57,56 +65,93 @@ def read_root():
 @app.post("/scrape")
 def scrape_finance(db: Session = Depends(get_db)):
     api_key = os.getenv("NEWS_API_KEY")
-    if not api_key:
-        raise HTTPException(status_code=500, detail="NewsAPI Key missing")
     
-    # STRATEGY: Mix of Indian and Global Markets
-    sources = [
-        {"country": "in", "category": "business", "label": "🇮🇳 India Market"},
-        {"country": "us", "category": "business", "label": "🇺🇸 US Market"}
-    ]
+    # --- 1. CALCULATE TIME THRESHOLD ---
+    # Check the newest article in our DB
+    last_news = db.query(NewsItem).order_by(NewsItem.published_at.desc()).first()
     
-    total_scraped = 0
+    today_midnight = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    if last_news and last_news.published_at:
+        # If we have data, fetch everything PUBLISHED AFTER the last one
+        # We add 1 second to avoid fetching the exact same article again
+        last_time = last_news.published_at.replace(tzinfo=timezone.utc)
+        from_param = (last_time + timedelta(seconds=1)).isoformat()
+        print(f"🔄 Fetching global news newer than: {last_time}")
+    else:
+        # If DB is empty, fetch from TODAY 00:00
+        from_param = today_midnight.isoformat()
+        print(f"🆕 First run: Fetching global news from: {today_midnight}")
+
+    # --- 2. GLOBAL SEARCH QUERY ---
+    # searching for broad financial terms
+    query = "finance OR stock market OR economy OR business"
     
-    for source in sources:
-        print(f"Fetching {source['label']}...")
-        url = f"https://newsapi.org/v2/top-headlines?country={source['country']}&category={source['category']}&apiKey={api_key}"
+    url = (
+        f"https://newsapi.org/v2/everything?"
+        f"q={query}&"
+        f"from={from_param}&"
+        f"sortBy=publishedAt&" # Important: Get Newest First
+        f"language=en&"
+        f"apiKey={api_key}"
+    )
+
+    try:
+        resp = requests.get(url)
+        data = resp.json()
         
-        try:
-            resp = requests.get(url)
-            data = resp.json()
-            articles = data.get("articles", [])[:6] # Fetch 6 from India, 6 from US
+        if data.get("status") != "ok":
+            print(f"API Error: {data.get('message')}")
+            return {"message": "Error from NewsAPI"}
+
+        # The API might return thousands of results. 
+        # We limit processing to the top 15 newest to save AI credits and speed.
+        articles = data.get("articles", [])[:15]
+        
+        # Reverse list to add Oldest -> Newest (keeps DB ID order logical)
+        articles.reverse() 
+
+        count = 0
+        for article in articles: 
+            if not article.get('title'): continue
             
-            for article in articles:
-                if not article.get('title'):
-                    continue
-                
-                # Check duplicates
-                existing = db.query(NewsItem).filter(NewsItem.url == article['url']).first()
-                if existing:
-                    continue
+            # Parse Date
+            try:
+                pub_date = parser.parse(article['publishedAt'])
+            except:
+                continue
 
-                # AI Analysis
-                raw_text = f"{article['title']} - {article.get('description', '')}"
-                summary, sentiment = generate_financial_summary(raw_text)
-                
-                # Save
-                news_item = NewsItem(
-                    title=article['title'],
-                    url=article['url'],
-                    summary=summary,
-                    sentiment_score=sentiment
-                )
-                db.add(news_item)
-                db.commit()
-                total_scraped += 1
-                
-        except Exception as e:
-            print(f"Error scraping {source['label']}: {e}")
-            continue
+            # Check Duplicate URL
+            if db.query(NewsItem).filter(NewsItem.url == article['url']).first():
+                continue
 
-    return {"message": f"Analysed {total_scraped} financial news items."}
+            print(f"   + Processing: {article['title'][:40]}...")
+
+            # AI Analysis
+            raw = f"{article['title']} - {article.get('description', '')}"
+            summary, sentiment = generate_financial_summary(raw)
+
+            news_item = NewsItem(
+                title=article['title'],
+                url=article['url'],
+                summary=summary.strip(),
+                sentiment_score=sentiment.strip(),
+                published_at=pub_date
+            )
+            db.add(news_item)
+            count += 1
+        
+        db.commit() 
+
+        if count == 0:
+            return {"message": "No new global financial news found since last check."}
+        
+        return {"message": f"Scraped {count} new global articles!"}
+
+    except Exception as e:
+        return {"message": f"System Error: {str(e)}"}
 
 @app.get("/news")
 def get_news(db: Session = Depends(get_db)):
-    return db.query(NewsItem).order_by(NewsItem.id.desc()).limit(20).all()
+    # Return newest first
+    return db.query(NewsItem).order_by(NewsItem.published_at.desc()).limit(50).all()
